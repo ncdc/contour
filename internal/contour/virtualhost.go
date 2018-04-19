@@ -14,10 +14,13 @@
 package contour
 
 import (
+	"log"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/envoyproxy/go-control-plane/envoy/api/v2/route"
+	"github.com/gogo/protobuf/types"
 	"k8s.io/api/extensions/v1beta1"
 )
 
@@ -85,27 +88,83 @@ func (v *VirtualHostCache) recomputevhost(vhost string, ingresses map[metadata]*
 			vv.Routes = []route.Route{r}
 			continue
 		}
-		for _, rule := range i.Spec.Rules {
-			if rule.Host != "" && rule.Host != vhost {
-				continue
+		if i.Annotations["weightedCluster"] == "true" {
+			clusters := []*route.WeightedCluster_ClusterWeight{}
+
+			r := route.Route{
+				Match: prefixmatch("/"),
 			}
-			if rule.IngressRuleValue.HTTP == nil {
-				// TODO(dfc) plumb a logger in here so we can log this error.
-				continue
-			}
-			for _, p := range rule.IngressRuleValue.HTTP.Paths {
-				r := route.Route{
-					Match:  pathToRouteMatch(p),
-					Action: action(i, &p.Backend),
+
+			for _, rule := range i.Spec.Rules {
+				if rule.Host != "" && rule.Host != vhost {
+					continue
 				}
-				if requireTLS {
-					r.Action = &route.Route_Redirect{
-						Redirect: &route.RedirectAction{
-							HttpsRedirect: true,
-						},
+				if rule.IngressRuleValue.HTTP == nil {
+					// TODO(dfc) plumb a logger in here so we can log this error.
+					continue
+				}
+
+				var defaultWeight uint64 = uint64(100) / uint64(len(rule.IngressRuleValue.HTTP.Paths))
+				for _, p := range rule.IngressRuleValue.HTTP.Paths {
+					name := ingressBackendToClusterName(i, &p.Backend)
+
+					weightStr := i.Annotations["weight."+p.Backend.ServiceName]
+					var v uint64
+					var err error
+					if weightStr == "" {
+						v = defaultWeight
+					} else {
+						v, err = strconv.ParseUint(weightStr, 10, 32)
+						if err != nil {
+							log.Println("error parsing", weightStr, err)
+							continue
+						}
 					}
+					weight := &types.UInt32Value{Value: uint32(v)}
+
+					cw := &route.WeightedCluster_ClusterWeight{
+						Name:   name,
+						Weight: weight,
+					}
+
+					clusters = append(clusters, cw)
 				}
-				vv.Routes = append(vv.Routes, r)
+			}
+
+			r.Action = &route.Route_Route{
+				Route: &route.RouteAction{
+					ClusterSpecifier: &route.RouteAction_WeightedClusters{
+						WeightedClusters: &route.WeightedCluster{
+							Clusters: clusters,
+						},
+					},
+				},
+			}
+
+			vv.Routes = append(vv.Routes, r)
+		} else {
+			for _, rule := range i.Spec.Rules {
+				if rule.Host != "" && rule.Host != vhost {
+					continue
+				}
+				if rule.IngressRuleValue.HTTP == nil {
+					// TODO(dfc) plumb a logger in here so we can log this error.
+					continue
+				}
+				for _, p := range rule.IngressRuleValue.HTTP.Paths {
+					r := route.Route{
+						Match:  pathToRouteMatch(p),
+						Action: action(i, &p.Backend),
+					}
+					if requireTLS {
+						r.Action = &route.Route_Redirect{
+							Redirect: &route.RedirectAction{
+								HttpsRedirect: true,
+							},
+						}
+					}
+					vv.Routes = append(vv.Routes, r)
+				}
 			}
 		}
 	}
